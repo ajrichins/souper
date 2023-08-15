@@ -1,5 +1,6 @@
 souperweb.tar.gz
 third_party
-build
+souper-build
 build-*
 *~
+settings.json

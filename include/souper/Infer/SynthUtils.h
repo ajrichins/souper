@@ -451,12 +451,16 @@ struct InfixPrinter {
 // TODO handle constraints on symbolic constants (Alex)
 // TODO incorporate width checks (MM)
 
+
+// will need to add typing for parameters and returns
 static const std::map<Inst::Kind, std::string> ArithDialectMap = {
   {Inst::Add, "arith.addi"},
   {Inst::Sub, "arith.subi"},
   {Inst::And, "arith.andi"},
   {Inst::Or, "arith.ori"},
   {Inst::Xor, "arith.xori"},
+  {Inst::SDiv, "arith.divsi"},
+  {Inst::SExt, "arith.extsi"},
 };
 
 struct PDLGenerator {
@@ -484,7 +488,7 @@ struct PDLGenerator {
   template <typename Stream>
   bool RHS(Stream &S) {
     if (!rhspre(S)) return false;
-    if (!printInsts(P.Mapping.LHS, S)) return false;
+    if (!printInsts(P.Mapping.RHS, S)) return false;
     if (!rhspost(S)) return false;
     return true;
   }
@@ -514,8 +518,12 @@ struct PDLGenerator {
     }
 
     indent(S);
-    S << "replace " << SymbolTable[P.Mapping.LHS] <<
-         " with " << SymbolTable[P.Mapping.RHS] << "\n";
+    S << "replace " << SymbolTable[P.Mapping.LHS] << " with ";
+    if (SymbolTable[P.Mapping.RHS].at(1) == 'v'){ // checking if replacing operation with value
+      S << "(" << SymbolTable[P.Mapping.RHS] << " : !pdl.value)\n";
+    } else {
+      S << SymbolTable[P.Mapping.RHS] << "\n";
+    }    
     Indent--;
     indent(S);
     S << "}\n";
@@ -534,10 +542,17 @@ struct PDLGenerator {
 
     for (auto &&Var : Vars) {
       if (SymbolTable.find(Var) == SymbolTable.end()) {
-        SymbolTable[Var] = "%v" + std::to_string(SymbolTable.size());
+        SymbolTable[Var] = "%" + Var->Name;
       }
-      indent(S);
-      S << SymbolTable[Var] << " = operand\n";
+      fetchTypeSSA(S, Var);
+      if (Var->Name.at(0) == 'v'){
+        // should probably add type restrictions to operands
+        indent(S);
+        S << SymbolTable[Var] << " = operand : " << getTypeSSA(Var) <<"\n";
+      } else {
+        indent(S);
+        S << SymbolTable[Var] << " = operation \"arith.constant\" -> (" << getTypeSSA(Var) << " : !pdl.type)\n";
+      }
       Visited.insert(Var);
     }
     return true;
@@ -565,27 +580,31 @@ struct PDLGenerator {
     Visited.insert(I);
 
     if (SymbolTable.find(I) == SymbolTable.end()) {
-      SymbolTable[I] = "%i" + std::to_string(SymbolTable.size());
+      SymbolTable[I] = "%" + std::to_string(SymbolTable.size());
     }
+
+    fetchTypeSSA(S, I);
 
     if (I->K == Inst::Const) {
       indent(S);
       S << "%" << extraSyms++ << " = attribute = " << llvm::toString(I->Val, 10, false)
-               << ":i" << I->Width << "\n";
+               << " : i" << I->Width << "\n";
+      std::string typeName = getTypeSSA(I);
       indent(S);
       S << SymbolTable[I] << " = operation \"arith.constant\" {\"value\" = %"
-                          << extraSyms - 1 << "}\n";
+                          << extraSyms - 1 << "} -> (" << typeName << " : !pdl.type)\n";
       return true;
-      // TODO: This seems sketchy, figure out how a better way to write literal constants
     }
 
     if (ArithDialectMap.find(I->K) == ArithDialectMap.end()) {
       llvm::errs() << Inst::getKindName(I->K) << " instruction not found in ArithDialectMap\n";
       return false;
     }
-
+    // preprint results
+    for (auto &&Op : I->Ops) 
+      fetchResultSSA(S, SymbolTable[Op]);
     indent(S);
-    S << "%" << extraSyms++ << " = pdl.operation \"" << ArithDialectMap.at(I->K) << "\"(";
+    S << SymbolTable[I] << " = pdl.operation \"" << ArithDialectMap.at(I->K) << "\"(";
 
     bool first = true;
     for (auto &&Op : I->Ops) {
@@ -598,16 +617,65 @@ struct PDLGenerator {
         llvm::errs() << "Operand not found in SymbolTable\n";
         return false;
       }
-      S << SymbolTable[Op];
+      S << getInputSSA(SymbolTable[Op]);
     }
 
-    // TODO: print type info
-    S << ")\n";
+    // print binding types of inputs
+    // for now its all just !pdl.value s
+    S << " : ";
+    first = true;
+    for (auto &&Op : I->Ops) {
+      if (first) {
+        first = false;
+      } else {
+        S << ", ";
+      }
+      S << "!pdl.value";
+    }
 
-    indent(S);
-    S << SymbolTable[I] << " = result 0 of %" << extraSyms - 1 << "\n";
+    // print return type
+    std::string typeName = getTypeSSA(I);
+    S << ") -> (" << typeName << " : !pdl.type)\n";
+
+    // get result if needed
 
     return true;
+  }
+
+  std::string getTypeSSA(Inst* I) {
+    std::string typeName = "%uint" + std::to_string(I->Width);
+    return typeName;
+  }
+
+  template <typename Stream>
+  void fetchTypeSSA(Stream &S, Inst* I) {
+    std::string typeName = "%uint" + std::to_string(I->Width);
+    if (TypeSSA.count(typeName) == 0) {
+      TypeSSA.emplace(typeName);
+      indent(S);
+      S << typeName << " = type : i" << I->Width << "\n";
+    }
+  }
+
+  template <typename Stream>
+  void fetchResultSSA(Stream &S, std::string op) {
+    if (op.at(1) != 'v'){
+      std::string resultName = "%r" + op.substr(1);
+      if (ResultSSA.count(resultName) == 0) {
+        ResultSSA.emplace(resultName);
+        indent(S);
+        S << resultName << " = result 0 of " << op << "\n";
+      }
+    }
+  }
+
+  std::string getInputSSA(std::string op) {
+    if (op.at(1) == 'v'){
+      return op;
+    } else {
+      std::string resultName = "%r" + op.substr(1);
+      return resultName;
+    }
   }
 
   template <typename Stream>
@@ -618,6 +686,8 @@ struct PDLGenerator {
   }
   std::set<Inst *> Visited;
   std::map<Inst *, std::string> SymbolTable;
+  std::set<std::string> TypeSSA;
+  std::set<std::string> ResultSSA;
   ParsedReplacement P;
   std::string Name;
   size_t Indent;

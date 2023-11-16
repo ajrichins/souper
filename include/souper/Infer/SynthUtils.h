@@ -461,22 +461,71 @@ static const std::map<Inst::Kind, std::string> ArithDialectMap = {
   {Inst::Xor, "arith.xori"},
   {Inst::SDiv, "arith.divsi"},
   {Inst::SExt, "arith.extsi"},
+  {Inst::Trunc, "arith.trunci"},
+  {Inst::SDiv, "arith.divsi"},
+  {Inst::Mul, "arith.muli"},
+  {Inst::SRem, "arith.remsi"},
+  {Inst::Select, "arith.select"},
+  {Inst::ZExt, "arith.extui"},
+  // CMPI
+  {Inst::Ne, "arith.cmpi"},
+  {Inst::Eq, "arith.cmpi"}
+};
+
+static const std::set<Inst::Kind> ArithCommunativeInst = {
+  Inst::Add,
+  Inst::And,
+  Inst::Or,
+  Inst::Xor,
+  Inst::Mul,
+  // CMPI
+  Inst::Ne,
+  Inst::Eq,
+};
+
+static const std::map<Inst::Kind, std::string> ArithCmpiInst = {
+  {Inst::Ne, "1"},
+  {Inst::Eq, "0"},
 };
 
 struct PDLGenerator {
   PDLGenerator(ParsedReplacement P_, std::string Name_)
-    : P(P_), Name(Name_), Indent(0) {}
+    : P(P_), Name(Name_), Indent(0){}
 
   template <typename Stream>
   bool operator()(Stream &S) {
-
-    std::ostringstream OS; // to bail out early without printing if needed
-    if (!pre(OS)) return false;
-    if (!LHS(OS)) return false;
-    if (!RHS(OS)) return false;
-    if (!post(OS)) return false;
-    S << OS.str();
+    int num_variations = (int)pow(2, (double)getNumOfCommutativeOps(P.Mapping.LHS));
+    Bitmask = (int*)malloc(sizeof(int));
+    Counter = (int*)malloc(sizeof(int));
+    for (*Bitmask = 0; *Bitmask < num_variations; (*Bitmask)++){
+      std::ostringstream OS; // to bail out early without printing if needed
+      if (!pre(OS)) return false;
+      *Counter = 0;
+      if (!LHS(OS)) return false;
+      (*Counter)++;
+      if (!RHS(OS)) return false;
+      if (!post(OS)) return false;
+      S << OS.str();
+      Visited.clear();
+      TypeSSA.clear();
+      AttributeSSA.clear();
+      ResultSSA.clear();
+    }
+    // loop over
+    free(Bitmask);
+    free(Counter);
     return true;
+  }
+
+  int getNumOfCommutativeOps(Inst *I){
+    int comSum = 0;
+    for (auto &&Op : I->Ops) {
+      comSum += getNumOfCommutativeOps(Op);
+    }
+    if (ArithCommunativeInst.count(I->K) > 0){
+      comSum++;
+    }
+    return comSum;
   }
 
   template <typename Stream>
@@ -500,7 +549,7 @@ struct PDLGenerator {
       return false;
     }
     indent(S);
-    S << "rewrite " << SymbolTable[P.Mapping.LHS] << " {\n";
+    S << "pdl.rewrite " << SymbolTable[P.Mapping.LHS] << " {\n";
     Indent++;
     return true;
   }
@@ -518,8 +567,8 @@ struct PDLGenerator {
     }
 
     indent(S);
-    S << "replace " << SymbolTable[P.Mapping.LHS] << " with ";
-    if (SymbolTable[P.Mapping.RHS].at(1) == 'v'){ // checking if replacing operation with value
+    S << "pdl.replace " << SymbolTable[P.Mapping.LHS] << " with ";
+    if (SymbolTable[P.Mapping.RHS].at(1) == 'v' || SymbolTable[P.Mapping.RHS].at(1) == 'n'){ // checking if replacing operation with value
       S << "(" << SymbolTable[P.Mapping.RHS] << " : !pdl.value)\n";
     } else {
       S << SymbolTable[P.Mapping.RHS] << "\n";
@@ -532,7 +581,7 @@ struct PDLGenerator {
 
   template <typename Stream>
   bool pre(Stream &S) {
-    S << "pdl.pattern @" << Name << " : benefit("
+    S << "pdl.pattern @" << Name << ((*Bitmask > 0) ? "_com_" + std::to_string(*Bitmask) : "") << " : benefit("
       << souper::benefit(P.Mapping.LHS, P.Mapping.RHS) << ") {\n";
     Indent++;
     // Type declarations go here
@@ -545,13 +594,13 @@ struct PDLGenerator {
         SymbolTable[Var] = "%" + Var->Name;
       }
       fetchTypeSSA(S, Var);
-      if (Var->Name.at(0) == 'v'){
+      if (Var->Name.at(0) != 's'){
         // should probably add type restrictions to operands
         indent(S);
-        S << SymbolTable[Var] << " = operand : " << getTypeSSA(Var) <<"\n";
+        S << SymbolTable[Var] << " = pdl.operand : " << getTypeSSA(Var) <<"\n";
       } else {
         indent(S);
-        S << SymbolTable[Var] << " = operation \"arith.constant\" -> (" << getTypeSSA(Var) << " : !pdl.type)\n";
+        S << SymbolTable[Var] << " = pdl.operation \"arith.constant\" -> (" << getTypeSSA(Var) << " : !pdl.type)\n";
       }
       Visited.insert(Var);
     }
@@ -586,13 +635,13 @@ struct PDLGenerator {
     fetchTypeSSA(S, I);
 
     if (I->K == Inst::Const) {
-      indent(S);
-      S << "%" << extraSyms++ << " = attribute = " << llvm::toString(I->Val, 10, false)
-               << " : i" << I->Width << "\n";
+      std::string valueAttrName = "%av" + llvm::toString(I->Val, 10, false);
+      std::string valueAttr = llvm::toString(I->Val, 10, false) + ((I->Width == 1) ? std::to_string(I->Width) : "");
+      fetchAttributeSSA(S, valueAttrName, valueAttr);
       std::string typeName = getTypeSSA(I);
       indent(S);
-      S << SymbolTable[I] << " = operation \"arith.constant\" {\"value\" = %"
-                          << extraSyms - 1 << "} -> (" << typeName << " : !pdl.type)\n";
+      S << SymbolTable[I] << " = pdl.operation \"arith.constant\" {\"value\" = "
+                          << valueAttrName << "} -> (" << typeName << " : !pdl.type)\n";
       return true;
     }
 
@@ -603,11 +652,87 @@ struct PDLGenerator {
     // preprint results
     for (auto &&Op : I->Ops) 
       fetchResultSSA(S, SymbolTable[Op]);
+
+    if (ArithCmpiInst.count(I->K) > 0) {
+      std::string predicateAttr = "%av" + ArithCmpiInst.at(I->K);
+      fetchAttributeSSA(S, predicateAttr, ArithCmpiInst.at(I->K));
+      std::string typeName = getTypeSSA(I);
+      indent(S);
+      S << SymbolTable[I] << " = pdl.operation \"" << ArithDialectMap.at(I->K) << "\"(";
+      if (!addOperandsAndBindings(S, I))
+        return false;
+      S << ") {\"predicate\" = " << predicateAttr << "} -> (" << typeName << " : !pdl.type)\n";
+      return true;
+    }
+
     indent(S);
     S << SymbolTable[I] << " = pdl.operation \"" << ArithDialectMap.at(I->K) << "\"(";
 
+    if (!addOperandsAndBindings(S, I))
+      return false;
+    // print return type
+    std::string typeName = getTypeSSA(I);
+    S << ") -> (" << typeName << " : !pdl.type)\n";
+
+    // get result if needed
+
+    return true;
+  }
+
+
+
+  std::string getTypeSSA(Inst* I) {
+    return TypeSSA[I->Width];
+  }
+
+  template <typename Stream>
+  void fetchTypeSSA(Stream &S, Inst* I) {
+    if (TypeSSA.count(I->Width) == 0) {
+      std::string typeName;
+      indent(S);
+      if (I->Width == 1){ // or if the type is specified
+        typeName = "%uint" + std::to_string(I->Width);
+        S << typeName << " = pdl.type : i" << I->Width << "\n";
+        TypeSSA[I->Width] = typeName;
+      }else{ 
+        typeName = "%type" + std::to_string(TypeSSA.size());
+        S << typeName << " = pdl.type\n";
+      }
+      TypeSSA[I->Width] = typeName;
+    }
+  }
+
+  template <typename Stream>
+  void fetchAttributeSSA(Stream &S, std::string name, std::string attr) {
+    if (AttributeSSA.emplace(name).second) {
+      indent(S);
+      S << name << " = pdl.attribute = " << attr << "\n";
+    }
+  }
+
+  template <typename Stream>
+  void fetchResultSSA(Stream &S, std::string op) {
+    if (op.at(1) != 'v' && op.at(1) != 'n'){
+      std::string resultName = "%r" + op.substr(1);
+      if (ResultSSA.count(resultName) == 0) {
+        ResultSSA.emplace(resultName);
+        indent(S);
+        S << resultName << " = pdl.result 0 of " << op << "\n";
+      }
+    }
+  }
+
+  template <typename Stream>
+  bool addOperandsAndBindings(Stream &S, Inst* I) {
     bool first = true;
-    for (auto &&Op : I->Ops) {
+    std::vector<Inst*> opsOrdered(I->Ops);
+    if (ArithCommunativeInst.count(I->K) > 0){
+      if ((*Bitmask >> *Counter) & 1){
+        std::reverse(opsOrdered.begin(), opsOrdered.end());
+      }
+      (*Counter)++;
+    } 
+    for (auto &&Op : opsOrdered) {
       if (first) {
         first = false;
       } else {
@@ -624,7 +749,7 @@ struct PDLGenerator {
     // for now its all just !pdl.value s
     S << " : ";
     first = true;
-    for (auto &&Op : I->Ops) {
+    for (auto &&Op : opsOrdered) {
       if (first) {
         first = false;
       } else {
@@ -632,45 +757,11 @@ struct PDLGenerator {
       }
       S << "!pdl.value";
     }
-
-    // print return type
-    std::string typeName = getTypeSSA(I);
-    S << ") -> (" << typeName << " : !pdl.type)\n";
-
-    // get result if needed
-
     return true;
   }
 
-  std::string getTypeSSA(Inst* I) {
-    std::string typeName = "%uint" + std::to_string(I->Width);
-    return typeName;
-  }
-
-  template <typename Stream>
-  void fetchTypeSSA(Stream &S, Inst* I) {
-    std::string typeName = "%uint" + std::to_string(I->Width);
-    if (TypeSSA.count(typeName) == 0) {
-      TypeSSA.emplace(typeName);
-      indent(S);
-      S << typeName << " = type : i" << I->Width << "\n";
-    }
-  }
-
-  template <typename Stream>
-  void fetchResultSSA(Stream &S, std::string op) {
-    if (op.at(1) != 'v'){
-      std::string resultName = "%r" + op.substr(1);
-      if (ResultSSA.count(resultName) == 0) {
-        ResultSSA.emplace(resultName);
-        indent(S);
-        S << resultName << " = result 0 of " << op << "\n";
-      }
-    }
-  }
-
   std::string getInputSSA(std::string op) {
-    if (op.at(1) == 'v'){
+    if (op.at(1) == 'v' || op.at(1) == 'n'){
       return op;
     } else {
       std::string resultName = "%r" + op.substr(1);
@@ -686,9 +777,12 @@ struct PDLGenerator {
   }
   std::set<Inst *> Visited;
   std::map<Inst *, std::string> SymbolTable;
-  std::set<std::string> TypeSSA;
+  std::map<int, std::string> TypeSSA;
+  std::set<std::string> AttributeSSA;
   std::set<std::string> ResultSSA;
   ParsedReplacement P;
+  int* Bitmask;
+  int* Counter;
   std::string Name;
   size_t Indent;
 };
